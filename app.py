@@ -1,9 +1,16 @@
 from langchain.chains import RetrievalQA
-from langchain.embeddings import HuggingFaceEmbeddings
+#from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.vectorstores import Chroma
-from langchain.llms import Ollama
-from langchain import PromptTemplate
+#from langchain.vectorstores import Chroma
+from langchain_community.vectorstores import Chroma
+#from langchain.llms import Ollama
+from langchain_community.llms import Ollama
+from langchain.prompts import PromptTemplate
+from langchain.callbacks.manager import CallbackManager
+from langchain.schema.runnable import Runnable, RunnablePassthrough, RunnableConfig
+from langchain.schema import StrOutputParser
+from langchain.callbacks.base import BaseCallbackHandler
 import chromadb
 import os
 import argparse
@@ -47,7 +54,9 @@ async def start():
     # activate/deactivate the streaming StdOut callback for LLMs
     callbacks = [StreamingStdOutCallbackHandler()]
 
-    llm = Ollama(model=model, callbacks=callbacks)
+    llm = Ollama(model=model,
+                 callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]),)
+
 
     qa = RetrievalQA.from_chain_type(
         llm=llm, 
@@ -61,26 +70,78 @@ async def start():
     msg.content = "Hi, Welcome to Medical Bot. What is your query?"
     await msg.update()
 
+    def format_docs(docs):
+        return "\n\n".join([d.page_content for d in docs])
+
+    runnable = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | custom_prompt()
+        | llm
+        | StrOutputParser()
+    )
+
+    cl.user_session.set("runnable", runnable)
+
     cl.user_session.set("chain", chain)
 
+# @cl.on_message
+# async def main(message: cl.Message):
+#     chain = cl.user_session.get("chain") 
+#     cb = cl.AsyncLangchainCallbackHandler(
+#         stream_final_answer=True, answer_prefix_tokens=["FINAL", "ANSWER"]
+#     )
+#     cb.answer_reached = True
+#     res = await chain.acall(message.content, callbacks=[cb])
+#     #res = await chain(message)
+#     answer = res["result"]
+#     sources = res["source_documents"]
+
+#     if sources:
+#         answer += f"\n\nSources:" + str(sources)
+#     else:
+#         answer += "\n\nNo sources found"
+
+#     await cl.Message(content=answer).send()
+
 @cl.on_message
-async def main(message):
-    chain = cl.user_session.get("chain") 
-    cb = cl.AsyncLangchainCallbackHandler(
-        stream_final_answer=True, answer_prefix_tokens=["FINAL", "ANSWER"]
-    )
-    cb.answer_reached = True
-    #res = await chain.acall(message, callbacks=[cb])
-    res = chain(message)
-    answer = res["result"]
-    sources = res["source_documents"]
+async def on_message(message: cl.Message):
+    runnable = cl.user_session.get("runnable")  # type: Runnable
+    msg = cl.Message(content="")
 
-    if sources:
-        answer += f"\nSources:" + str(sources)
-    else:
-        answer += "\nNo sources found"
+    class PostMessageHandler(BaseCallbackHandler):
+        """
+        Callback handler for handling the retriever and LLM processes.
+        Used to post the sources of the retrieved documents as a Chainlit element.
+        """
 
-    await cl.Message(content=answer).send()
+        def __init__(self, msg: cl.Message):
+            BaseCallbackHandler.__init__(self)
+            self.msg = msg
+            self.sources = set()  # To store unique pairs
+
+        def on_retriever_end(self, documents, *, run_id, parent_run_id, **kwargs):
+            for d in documents:
+                source_page_pair = (d.metadata['source'], d.metadata['page'])
+                self.sources.add(source_page_pair)  # Add unique pairs to the set
+
+        def on_llm_end(self, response, *, run_id, parent_run_id, **kwargs):
+            if len(self.sources):
+                sources_text = "\n".join([f"{source}#page={page}" for source, page in self.sources])
+                self.msg.elements.append(
+                    cl.Text(name="Sources", content=sources_text, display="inline")
+                )
+
+    async with cl.Step(type="run", name="Doc Assistant"):
+        async for chunk in runnable.astream(
+            message.content,
+            config=RunnableConfig(callbacks=[
+                cl.LangchainCallbackHandler(),
+                PostMessageHandler(msg)
+            ]),
+        ):
+            await msg.stream_token(chunk)
+
+    await msg.send()
 
 
 
