@@ -16,6 +16,7 @@ import os
 import argparse
 import time
 import chainlit as cl
+from typing import Dict, Optional
 
 model = os.environ.get("MODEL", "llama2:13b")
 # For embeddings model, the example uses a sentence-transformers model
@@ -142,6 +143,18 @@ async def on_message(message: cl.Message):
             await msg.stream_token(chunk)
 
     await msg.send()
+
+@cl.oauth_callback
+def oauth_callback(
+  provider_id: str,
+  token: str,
+  raw_user_data: Dict[str, str],
+  default_user: cl.User,
+) -> Optional[cl.User]:
+  if provider_id == "google":
+    if raw_user_data["hd"] == "innovaccer.com":
+      return default_user
+  return None
 
 
 
